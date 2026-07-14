@@ -52,15 +52,18 @@ cargo run --example echo        # bot 起動
 
 ## ステータス
 
-M2 まで実装済み:
+M3 まで実装済み:
 
 - M1: `on_mention` + `Ctx::reply/post/react`、自己応答ループ防止、`isBot`
   無視、visibility 継承 (public→home 丸め)、DM (specified) 返信対応
 - M2: コマンドルーター (`.command("dice", ...)` + `ctx.args()`)、
   送信直列化 + `RATE_LIMIT_EXCEEDED` 指数バックオフ再送、
   イベント dedup (LRU 1024)
+- M3: cron スケジューラ (`.schedule("0 9 * * *", ...)`)、KV ストア
+  (`ctx.store()`)、再接続 catch-up (切断中のメンションを API で補完 —
+  WebSocket は切断中のイベントを replay しないため)
 
-次は M3 (scheduler + Store + 再接続 catch-up)。設計の詳細は
+次は M4 (on_note / on_reaction / on_follow / on_chat + CI)。設計の詳細は
 [ARCHITECTURE.md](ARCHITECTURE.md) を参照。
 
 ```sh

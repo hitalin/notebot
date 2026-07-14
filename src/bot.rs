@@ -14,21 +14,29 @@ use notecli::streaming::StreamingManager;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::context::{BotAccount, Ctx};
+use crate::context::{BotAccount, BotHandle, Ctx};
 use crate::error::{NotebotError, Result};
 use crate::event::{parse_event, BotEvent, ChannelEmitter, SeenCache};
 use crate::gate::SendGate;
 use crate::router::parse_command;
+use crate::scheduler::{spawn_jobs, Job, ScheduleHandler};
+use crate::store::Store;
 
 type Handler = Arc<dyn Fn(Ctx) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
 /// 再接続時の重複・mention/notification 二重発火を吸収する LRU 容量。
 const SEEN_CACHE_CAPACITY: usize = 1024;
+/// 最後に処理した mention の note id (catch-up 用)。
+const LAST_MENTION_KEY: &str = "notebot.last_mention_id";
+/// catch-up 1 ページの取得件数と最大ページ数。
+const CATCHUP_PAGE_SIZE: i64 = 100;
+const CATCHUP_MAX_PAGES: usize = 10;
 
 pub struct BotBuilder {
     account_spec: Option<String>,
     commands: std::collections::HashMap<String, Handler>,
     on_mention: Option<Handler>,
+    schedules: Vec<(String, ScheduleHandler)>,
     ignore_bots: bool,
 }
 
@@ -63,6 +71,18 @@ impl BotBuilder {
         self
     }
 
+    /// cron スケジュールでジョブを実行する (`"0 9 * * *"` = 毎日 9:00、
+    /// ローカルタイムゾーン)。パターンの検証は `build()` で行う。
+    pub fn schedule<F, Fut>(mut self, pattern: impl Into<String>, f: F) -> Self
+    where
+        F: Fn(BotHandle) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.schedules
+            .push((pattern.into(), Arc::new(move |bot| Box::pin(f(bot)))));
+        self
+    }
+
     /// `isBot` ユーザーからのメンションを無視するか (デフォルト true)。
     /// bot 同士の無限ループ防止。false にする場合は自前で対策すること。
     pub fn ignore_bots(mut self, ignore: bool) -> Self {
@@ -71,10 +91,28 @@ impl BotBuilder {
     }
 
     pub fn build(self) -> Result<Bot> {
+        let jobs = self
+            .schedules
+            .into_iter()
+            .map(|(pattern, handler)| {
+                let cron = croner::Cron::new(&pattern)
+                    .with_seconds_optional()
+                    .parse()
+                    .map_err(|e| {
+                        NotebotError::Config(format!("invalid cron pattern {pattern:?}: {e}"))
+                    })?;
+                Ok(Job {
+                    cron,
+                    source: pattern,
+                    handler,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Bot {
             account_spec: self.account_spec,
             commands: self.commands,
             on_mention: self.on_mention,
+            jobs,
             ignore_bots: self.ignore_bots,
         })
     }
@@ -84,6 +122,7 @@ pub struct Bot {
     account_spec: Option<String>,
     commands: std::collections::HashMap<String, Handler>,
     on_mention: Option<Handler>,
+    jobs: Vec<Job>,
     ignore_bots: bool,
 }
 
@@ -93,20 +132,23 @@ impl Bot {
             account_spec: None,
             commands: std::collections::HashMap::new(),
             on_mention: None,
+            schedules: Vec::new(),
             ignore_bots: true,
         }
     }
 
     /// bot を起動し、SIGINT/SIGTERM まで動き続ける。
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(mut self) -> Result<()> {
         let db = Arc::new(Database::open(&notecli_db_path())?);
         let client = Arc::new(MisskeyClient::new()?);
         let creds = self.resolve_credentials(&db, &client).await?;
         tracing::info!(account = %format!("@{}@{}", creds.username, creds.host), "starting bot");
 
+        let store = Arc::new(Store::open(store_path(&creds.account_id))?);
+
         let (tx, mut rx) = mpsc::unbounded_channel();
         let manager = StreamingManager::new(
-            Arc::new(ChannelEmitter::new(tx)),
+            Arc::new(ChannelEmitter::new(tx.clone())),
             Arc::new(EventBus::new()),
             db.clone(),
         );
@@ -114,14 +156,19 @@ impl Bot {
         manager.subscribe_main(&creds.account_id).await?;
 
         let account_id = creds.account_id.clone();
-        let bot_account = Arc::new(BotAccount {
-            id: creds.account_id,
-            host: creds.host,
-            token: creds.token,
-            user_id: creds.user_id,
-        });
-        let gate = Arc::new(SendGate::new());
+        let handle = BotHandle {
+            client,
+            account: Arc::new(BotAccount {
+                id: creds.account_id,
+                host: creds.host,
+                token: creds.token,
+                user_id: creds.user_id,
+            }),
+            gate: Arc::new(SendGate::new()),
+            store,
+        };
         let mut seen = SeenCache::new(SEEN_CACHE_CAPACITY);
+        let jobs = spawn_jobs(std::mem::take(&mut self.jobs), &handle);
 
         loop {
             tokio::select! {
@@ -131,9 +178,12 @@ impl Bot {
                 }
                 recv = rx.recv() => {
                     let Some((name, payload)) = recv else { break };
-                    self.handle_event(&name, payload, &client, &bot_account, &gate, &mut seen);
+                    self.handle_event(&name, payload, &handle, &tx, &mut seen);
                 }
             }
+        }
+        for job in &jobs {
+            job.abort();
         }
         manager.disconnect(&account_id).await;
         Ok(())
@@ -194,30 +244,36 @@ impl Bot {
         &self,
         name: &str,
         payload: Value,
-        client: &Arc<MisskeyClient>,
-        account: &Arc<BotAccount>,
-        gate: &Arc<SendGate>,
+        handle: &BotHandle,
+        tx: &mpsc::UnboundedSender<(String, Value)>,
         seen: &mut SeenCache,
     ) {
         let Some(event) = parse_event(name, &payload) else {
             return;
         };
         match event {
-            BotEvent::Status { state } => tracing::info!(state, "stream status"),
+            BotEvent::Status { state } => {
+                tracing::info!(state, "stream status");
+                if state == "connected" {
+                    // 切断中に来たメンションを補完 (初回接続時は前回起動分)
+                    spawn_catchup(handle.clone(), tx.clone());
+                }
+            }
             BotEvent::Mention(note) => {
                 if !seen.insert(&note.id) {
                     return;
                 }
-                if !should_handle(&note, &account.user_id, self.ignore_bots) {
+                // 無視するメンションでも last id は進める —
+                // catch-up で同じノートを永遠に再取得しないため
+                record_last_mention(handle.store(), &note.id);
+                if !should_handle(&note, &handle.account.user_id, self.ignore_bots) {
                     return;
                 }
                 let Some((handler, args)) = self.route(&note) else {
                     return;
                 };
                 let ctx = Ctx {
-                    client: client.clone(),
-                    account: account.clone(),
-                    gate: gate.clone(),
+                    bot: handle.clone(),
                     note: *note,
                     args,
                 };
@@ -249,6 +305,75 @@ struct Credentials {
     token: String,
     user_id: String,
     username: String,
+}
+
+/// 最後に処理した mention の note id を進める。Misskey の note id は
+/// 時系列ソート可能な固定長文字列なので文字列比較で新旧を判定できる。
+fn record_last_mention(store: &Store, id: &str) {
+    let prev: Option<String> = store.get(LAST_MENTION_KEY).unwrap_or_default();
+    if prev.as_deref().is_none_or(|p| id > p) {
+        if let Err(e) = store.set(LAST_MENTION_KEY, &id) {
+            tracing::warn!(error = %e, "failed to persist last mention id");
+        }
+    }
+}
+
+/// 切断中に取りこぼしたメンションを API で補完取得し、通常のイベント
+/// パイプラインに `stream-mention` として再注入する (dedup・フィルタ・
+/// ルーティングをそのまま通る)。last id が無い初回起動は履歴を replay
+/// しない。
+fn spawn_catchup(handle: BotHandle, tx: mpsc::UnboundedSender<(String, Value)>) {
+    tokio::spawn(async move {
+        let mut since_id = match handle.store().get::<String>(LAST_MENTION_KEY) {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "catch-up: failed to read last mention id");
+                return;
+            }
+        };
+        for page in 0..CATCHUP_MAX_PAGES {
+            let notes = match handle
+                .client
+                .get_mentions(
+                    &handle.account.host,
+                    &handle.account.token,
+                    &handle.account.id,
+                    CATCHUP_PAGE_SIZE,
+                    Some(&since_id),
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(notes) => notes,
+                Err(e) => {
+                    tracing::warn!(error = %e, "catch-up: fetch failed");
+                    return;
+                }
+            };
+            if notes.is_empty() {
+                return;
+            }
+            let count = notes.len();
+            let Some(max_id) = notes.iter().map(|n| n.id.clone()).max() else {
+                return;
+            };
+            tracing::info!(count, page, "catch-up: replaying missed mentions");
+            for note in notes {
+                let payload = serde_json::json!({ "note": note });
+                let _ = tx.send(("stream-mention".to_string(), payload));
+            }
+            if (count as i64) < CATCHUP_PAGE_SIZE {
+                return;
+            }
+            since_id = max_id;
+        }
+        tracing::warn!(
+            max = CATCHUP_MAX_PAGES * CATCHUP_PAGE_SIZE as usize,
+            "catch-up: page limit reached; older mentions were skipped"
+        );
+    });
 }
 
 /// `NOTEBOT_TOKEN` / `NOTEBOT_TOKEN_FILE` からトークンを読む。
@@ -316,14 +441,31 @@ fn resolve_account(db: &Database, spec: Option<&str>) -> Result<Account> {
         .ok_or_else(|| NotebotError::AccountNotFound(spec.to_string()))
 }
 
+fn data_base_dir() -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".local/share")
+    })
+}
+
 fn notecli_db_path() -> PathBuf {
-    dirs::data_dir()
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".local/share")
+    data_base_dir().join("notecli").join("notecli.db")
+}
+
+/// `{data_dir}/notebot/{account_id}/store.json`。account_id には
+/// `env:{user_id}@{host}` 形式が来るためファイル名に安全な文字へ丸める。
+fn store_path(account_id: &str) -> PathBuf {
+    let safe: String = account_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '-'
+            }
         })
-        .join("notecli")
-        .join("notecli.db")
+        .collect();
+    data_base_dir().join("notebot").join(safe).join("store.json")
 }
 
 async fn shutdown_signal() {
@@ -437,6 +579,42 @@ mod tests {
             read_env_token(None, Some("/nonexistent/token".into())),
             Err(NotebotError::Config(_))
         ));
+    }
+
+    #[test]
+    fn build_rejects_invalid_cron_pattern() {
+        let result = Bot::builder()
+            .schedule("not a cron", |_| async { Ok(()) })
+            .build();
+        assert!(matches!(result, Err(NotebotError::Config(_))));
+        assert!(Bot::builder()
+            .schedule("0 9 * * *", |_| async { Ok(()) })
+            .build()
+            .is_ok());
+    }
+
+    #[test]
+    fn last_mention_id_only_moves_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.json")).unwrap();
+        record_last_mention(&store, "aaa2");
+        record_last_mention(&store, "aaa1"); // 古い id では戻らない
+        assert_eq!(
+            store.get::<String>(LAST_MENTION_KEY).unwrap().as_deref(),
+            Some("aaa2")
+        );
+        record_last_mention(&store, "aaa3");
+        assert_eq!(
+            store.get::<String>(LAST_MENTION_KEY).unwrap().as_deref(),
+            Some("aaa3")
+        );
+    }
+
+    #[test]
+    fn store_path_sanitizes_account_id() {
+        let path = store_path("env:u1@misskey.example");
+        let dir_name = path.parent().unwrap().file_name().unwrap().to_string_lossy();
+        assert_eq!(dir_name, "env-u1-misskey.example");
     }
 
     #[test]

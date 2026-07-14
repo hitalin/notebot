@@ -23,11 +23,14 @@ pub mod error;
 pub mod event;
 mod gate;
 mod router;
+mod scheduler;
+pub mod store;
 
 pub use bot::{Bot, BotBuilder};
-pub use context::Ctx;
+pub use context::{BotHandle, Ctx};
 pub use error::{NotebotError, Result};
 pub use event::BotEvent;
+pub use store::Store;
 
 /// エスケープハッチ: notecli のモデル・クライアントを直接使う場合に。
 pub use notecli;

@@ -8,6 +8,8 @@ pub enum NotebotError {
     UnexpectedResponse(String),
     #[error("configuration error: {0}")]
     Config(String),
+    #[error("store error: {0}")]
+    Store(String),
 }
 
 pub type Result<T> = std::result::Result<T, NotebotError>;
