@@ -1,0 +1,20 @@
+{
+  "name": "notebot",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  },
+  "mounts": [
+    "source=notebot-cargo-registry,target=/usr/local/cargo/registry,type=volume"
+  ],
+  "postCreateCommand": "cargo fetch",
+  "remoteUser": "vscode"
+}

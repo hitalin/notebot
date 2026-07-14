@@ -105,6 +105,17 @@ cargo run --example greeter   # フォローバック + リアクション集計
 （OS キーチェーン保管）が使える。`NOTEBOT_TOKEN` が設定されていれば
 そちらが優先される。
 
+## 開発環境 (Dev Container)
+
+`.devcontainer/` に最小構成を用意している (Rust stable + rust-analyzer +
+cargo registry キャッシュ volume)。VS Code の「Reopen in Container」または
+GitHub Codespaces で開けばビルド・テストがそのまま動く。
+
+- コンテナ内では OS キーチェーンが使えないため、bot の実行確認は
+  `NOTEBOT_TOKEN` / `NOTEBOT_HOST` の環境変数経路で行う
+  (テストはキーチェーンに触れないので影響なし)
+- ホストに Rust toolchain があるなら devcontainer は必須ではない
+
 ## License
 
 MIT
