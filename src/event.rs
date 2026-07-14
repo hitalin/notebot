@@ -53,6 +53,39 @@ pub(crate) fn parse_event(name: &str, payload: &Value) -> Option<BotEvent> {
     }
 }
 
+/// note id の重複検出 (LRU)。mention は `stream-mention` と
+/// `stream-notification` の両方で届き得るため、また再接続時の重複対策。
+pub(crate) struct SeenCache {
+    set: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl SeenCache {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            set: std::collections::HashSet::with_capacity(cap),
+            order: std::collections::VecDeque::with_capacity(cap),
+            cap,
+        }
+    }
+
+    /// 新規なら記録して true、既知なら false。
+    pub(crate) fn insert(&mut self, id: &str) -> bool {
+        if self.set.contains(id) {
+            return false;
+        }
+        self.set.insert(id.to_string());
+        self.order.push_back(id.to_string());
+        if self.order.len() > self.cap {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +138,23 @@ mod tests {
     fn malformed_mention_is_ignored() {
         let payload = json!({ "note": { "id": 42 } });
         assert!(parse_event("stream-mention", &payload).is_none());
+    }
+
+    #[test]
+    fn seen_cache_detects_duplicates() {
+        let mut seen = SeenCache::new(8);
+        assert!(seen.insert("a"));
+        assert!(!seen.insert("a"));
+        assert!(seen.insert("b"));
+    }
+
+    #[test]
+    fn seen_cache_evicts_oldest() {
+        let mut seen = SeenCache::new(2);
+        assert!(seen.insert("a"));
+        assert!(seen.insert("b"));
+        assert!(seen.insert("c")); // "a" が追い出される
+        assert!(seen.insert("a")); // 再び新規扱い
+        assert!(!seen.insert("c"));
     }
 }

@@ -16,12 +16,18 @@ use tokio::sync::mpsc;
 
 use crate::context::{BotAccount, Ctx};
 use crate::error::{NotebotError, Result};
-use crate::event::{parse_event, BotEvent, ChannelEmitter};
+use crate::event::{parse_event, BotEvent, ChannelEmitter, SeenCache};
+use crate::gate::SendGate;
+use crate::router::parse_command;
 
 type Handler = Arc<dyn Fn(Ctx) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
+/// 再接続時の重複・mention/notification 二重発火を吸収する LRU 容量。
+const SEEN_CACHE_CAPACITY: usize = 1024;
+
 pub struct BotBuilder {
     account_spec: Option<String>,
+    commands: std::collections::HashMap<String, Handler>,
     on_mention: Option<Handler>,
     ignore_bots: bool,
 }
@@ -35,7 +41,19 @@ impl BotBuilder {
         self
     }
 
-    /// メンションを受けたときのハンドラ。
+    /// メンションコマンド (`@bot <name> [引数...]`) のハンドラ。
+    /// name は大文字小文字を区別しない。引数は `ctx.args()` で取れる。
+    pub fn command<F, Fut>(mut self, name: impl Into<String>, f: F) -> Self
+    where
+        F: Fn(Ctx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.commands
+            .insert(name.into().to_lowercase(), Arc::new(move |ctx| Box::pin(f(ctx))));
+        self
+    }
+
+    /// どのコマンドにも一致しないメンションのハンドラ。
     pub fn on_mention<F, Fut>(mut self, f: F) -> Self
     where
         F: Fn(Ctx) -> Fut + Send + Sync + 'static,
@@ -55,6 +73,7 @@ impl BotBuilder {
     pub fn build(self) -> Result<Bot> {
         Ok(Bot {
             account_spec: self.account_spec,
+            commands: self.commands,
             on_mention: self.on_mention,
             ignore_bots: self.ignore_bots,
         })
@@ -63,6 +82,7 @@ impl BotBuilder {
 
 pub struct Bot {
     account_spec: Option<String>,
+    commands: std::collections::HashMap<String, Handler>,
     on_mention: Option<Handler>,
     ignore_bots: bool,
 }
@@ -71,6 +91,7 @@ impl Bot {
     pub fn builder() -> BotBuilder {
         BotBuilder {
             account_spec: None,
+            commands: std::collections::HashMap::new(),
             on_mention: None,
             ignore_bots: true,
         }
@@ -99,6 +120,8 @@ impl Bot {
             token: creds.token,
             user_id: creds.user_id,
         });
+        let gate = Arc::new(SendGate::new());
+        let mut seen = SeenCache::new(SEEN_CACHE_CAPACITY);
 
         loop {
             tokio::select! {
@@ -108,7 +131,7 @@ impl Bot {
                 }
                 recv = rx.recv() => {
                     let Some((name, payload)) = recv else { break };
-                    self.handle_event(&name, payload, &client, &bot_account);
+                    self.handle_event(&name, payload, &client, &bot_account, &gate, &mut seen);
                 }
             }
         }
@@ -173,6 +196,8 @@ impl Bot {
         payload: Value,
         client: &Arc<MisskeyClient>,
         account: &Arc<BotAccount>,
+        gate: &Arc<SendGate>,
+        seen: &mut SeenCache,
     ) {
         let Some(event) = parse_event(name, &payload) else {
             return;
@@ -180,19 +205,23 @@ impl Bot {
         match event {
             BotEvent::Status { state } => tracing::info!(state, "stream status"),
             BotEvent::Mention(note) => {
+                if !seen.insert(&note.id) {
+                    return;
+                }
                 if !should_handle(&note, &account.user_id, self.ignore_bots) {
                     return;
                 }
-                let Some(handler) = &self.on_mention else {
+                let Some((handler, args)) = self.route(&note) else {
                     return;
                 };
                 let ctx = Ctx {
                     client: client.clone(),
                     account: account.clone(),
+                    gate: gate.clone(),
                     note: *note,
+                    args,
                 };
                 let note_id = ctx.note.id.clone();
-                let handler = handler.clone();
                 // ハンドラは task 分離: Err/panic で bot 本体を落とさない
                 tokio::spawn(async move {
                     if let Err(e) = handler(ctx).await {
@@ -201,6 +230,16 @@ impl Bot {
                 });
             }
         }
+    }
+
+    /// コマンドに一致すればそのハンドラと引数、しなければ on_mention。
+    fn route(&self, note: &NormalizedNote) -> Option<(Handler, Vec<String>)> {
+        if let Some((cmd, args)) = note.text.as_deref().and_then(parse_command) {
+            if let Some(handler) = self.commands.get(&cmd) {
+                return Some((handler.clone(), args));
+            }
+        }
+        self.on_mention.as_ref().map(|h| (h.clone(), Vec::new()))
     }
 }
 

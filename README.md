@@ -52,13 +52,20 @@ cargo run --example echo        # bot 起動
 
 ## ステータス
 
-M1 (echo bot が動く最小構成) 実装済み: `on_mention` + `Ctx::reply/post/react`、
-自己応答ループ防止、`isBot` 無視、visibility 継承 (public→home 丸め)、
-DM (specified) 返信対応。次は M2 (command router + 残りの安全装置)。
-設計の詳細は [ARCHITECTURE.md](ARCHITECTURE.md) を参照。
+M2 まで実装済み:
+
+- M1: `on_mention` + `Ctx::reply/post/react`、自己応答ループ防止、`isBot`
+  無視、visibility 継承 (public→home 丸め)、DM (specified) 返信対応
+- M2: コマンドルーター (`.command("dice", ...)` + `ctx.args()`)、
+  送信直列化 + `RATE_LIMIT_EXCEEDED` 指数バックオフ再送、
+  イベント dedup (LRU 1024)
+
+次は M3 (scheduler + Store + 再接続 catch-up)。設計の詳細は
+[ARCHITECTURE.md](ARCHITECTURE.md) を参照。
 
 ```sh
 cargo run --example echo   # メンションをオウム返しする bot
+cargo run --example dice   # ダイスロール (@bot dice 6 3 / @bot ping)
 ```
 
 ## Docker Compose での運用

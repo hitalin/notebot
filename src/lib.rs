@@ -21,6 +21,8 @@ pub mod bot;
 pub mod context;
 pub mod error;
 pub mod event;
+mod gate;
+mod router;
 
 pub use bot::{Bot, BotBuilder};
 pub use context::Ctx;

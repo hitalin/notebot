@@ -7,6 +7,7 @@ use notecli::api::MisskeyClient;
 use notecli::models::{CreateNoteParams, NormalizedNote, RawNote};
 
 use crate::error::{NotebotError, Result};
+use crate::gate::SendGate;
 
 #[derive(Debug)]
 pub(crate) struct BotAccount {
@@ -19,7 +20,9 @@ pub(crate) struct BotAccount {
 pub struct Ctx {
     pub(crate) client: Arc<MisskeyClient>,
     pub(crate) account: Arc<BotAccount>,
+    pub(crate) gate: Arc<SendGate>,
     pub(crate) note: NormalizedNote,
+    pub(crate) args: Vec<String>,
 }
 
 /// 返信の visibility は元ノートを継承するが、public は home に丸める
@@ -35,6 +38,12 @@ impl Ctx {
     /// 発火元ノート。
     pub fn note(&self) -> &NormalizedNote {
         &self.note
+    }
+
+    /// コマンド引数 (`@bot dice 6 2` なら `["6", "2"]`)。
+    /// `on_mention` ハンドラでは常に空。
+    pub fn args(&self) -> &[String] {
+        &self.args
     }
 
     /// 発火元ノートへ返信する。visibility は継承 (public→home 丸め)、
@@ -59,8 +68,15 @@ impl Ctx {
             scheduled_at: None,
         };
         Ok(self
-            .client
-            .create_note(&self.account.host, &self.account.token, &self.account.id, params)
+            .gate
+            .send(|| {
+                self.client.create_note(
+                    &self.account.host,
+                    &self.account.token,
+                    &self.account.id,
+                    params.clone(),
+                )
+            })
             .await?)
     }
 
@@ -83,8 +99,15 @@ impl Ctx {
             "visibleUserIds": ids,
         });
         let data = self
-            .client
-            .request(&self.account.host, &self.account.token, "notes/create", body)
+            .gate
+            .send(|| {
+                self.client.request(
+                    &self.account.host,
+                    &self.account.token,
+                    "notes/create",
+                    body.clone(),
+                )
+            })
             .await?;
         let created = data
             .get("createdNote")
@@ -110,15 +133,29 @@ impl Ctx {
             scheduled_at: None,
         };
         Ok(self
-            .client
-            .create_note(&self.account.host, &self.account.token, &self.account.id, params)
+            .gate
+            .send(|| {
+                self.client.create_note(
+                    &self.account.host,
+                    &self.account.token,
+                    &self.account.id,
+                    params.clone(),
+                )
+            })
             .await?)
     }
 
     /// 発火元ノートにリアクションする。
     pub async fn react(&self, reaction: &str) -> Result<()> {
-        self.client
-            .create_reaction(&self.account.host, &self.account.token, &self.note.id, reaction)
+        self.gate
+            .send(|| {
+                self.client.create_reaction(
+                    &self.account.host,
+                    &self.account.token,
+                    &self.note.id,
+                    reaction,
+                )
+            })
             .await?;
         Ok(())
     }
