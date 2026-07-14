@@ -61,6 +61,24 @@ DM (specified) 返信対応。次は M2 (command router + 残りの安全装置)
 cargo run --example echo   # メンションをオウム返しする bot
 ```
 
+## Docker Compose での運用
+
+```sh
+docker compose build
+docker compose run --rm bot notecli login misskey.example   # 初回のみ: コンテナ内でログイン
+docker compose up -d
+docker compose logs -f bot
+```
+
+- トークンは named volume (`notebot-data`) 内の notecli.db に保存される。
+  コンテナでは OS キーチェーンが使えないため keyring 無効でビルドしている
+- **ホストで `notecli login` したアカウントは使えない**（トークンがホストの
+  キーチェーンにあり、volume を共有しても DB には無い）。必ず上記のとおり
+  コンテナ内でログインすること
+- 別の bot を動かす場合: `docker compose build --build-arg EXAMPLE=<name>`
+  （`examples/<name>.rs` をビルドする）
+- アカウント指定は `.env` の `NOTEBOT_ACCOUNT=@bot@host`
+
 ## License
 
 MIT

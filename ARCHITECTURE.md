@@ -217,6 +217,24 @@ bot ごとの複雑な永続化が必要なら利用者が自前の DB を持て
   される。**read-only オープンは不可** — `StreamingManager` が受信ノートを
   `db.cache_note()` で書き込むため、通常の読み書きオープンで共有する。
 
+### コンテナ運用 (Docker Compose)
+
+- コンテナ内では OS キーチェーンが使えない（Docker のデフォルト seccomp が
+  `keyctl`/`add_key` を塞ぐ。仮に通っても kernel keyring は非永続で、
+  notecli の lazy migration が DB トークンをクリアしてしまい再起動で
+  トークンを失う）。よって **Docker ビルドは `--no-default-features`**
+  （notebot の `keyring` feature を落とす）とし、トークンは volume 上の
+  notecli.db に平文で残す。保護はファイルパーミッション頼みになるが、
+  これは notecli 自身の keyring 無効時フォールバックと同じトレードオフ
+- 帰結として、ホストで keyring 有効ログインしたアカウントは volume を
+  共有してもコンテナから読めない（DB 側トークンは移行済みで空）。
+  ログインはコンテナ内 (`docker compose run --rm bot notecli login <host>`)
+  で行う。MiAuth は URL を開いて承認する方式で、コールバック用の
+  ポート開放は不要
+- イメージには example bot (`ARG EXAMPLE`, 既定 echo) と、運用用に同 rev の
+  notecli CLI を同梱する。SIGTERM は `run()` が処理するため
+  `docker stop` で graceful shutdown になる
+
 ## 9. エラー型
 
 ```rust
