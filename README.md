@@ -1,6 +1,6 @@
 # notebot
 
-[notecli](https://github.com/hitalin/notecli) をコアにした Misskey bot フレームワーク。
+[notecli](https://github.com/notedeck-dev/notecli) をコアにした Misskey bot フレームワーク。
 
 Misskey API・WebSocket ストリーミング（自動再接続つき）・MiAuth 認証・
 トークンのキーチェーン保管はすべて notecli が担い、notebot は

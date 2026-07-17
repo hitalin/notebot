@@ -260,7 +260,7 @@ pub enum NotebotError {
 
 ```toml
 [dependencies]
-notecli = { git = "https://github.com/hitalin/notecli.git", rev = "<pin>" }
+notecli = { git = "https://github.com/notedeck-dev/notecli.git", rev = "<pin>" }
 tokio   = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 serde / serde_json
 thiserror = "2"
